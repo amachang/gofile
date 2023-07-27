@@ -175,7 +175,11 @@ async fn download(content_id: ContentId) -> Result<(), Error> {
 }
 
 async fn download_impl(url: Url, filename: String) -> Result<(), Error> {
-    let res = reqwest::get(url).await?;
+    let client = reqwest::Client::new();
+    let res = client.get(url)
+        .header("Cookie", format!("accountToken={}", get_token()?))
+        .send()
+        .await?;
     let mut byte_stream = res.bytes_stream();
     let mut file = match tokio::fs::File::create(filename).await {
         Ok(file) => file,
