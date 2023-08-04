@@ -29,10 +29,20 @@ use std::{
         Display,
         Formatter,
     },
+    path::{
+        PathBuf,
+    },
 };
 
 use futures::{
     TryStreamExt,
+};
+
+use tokio::{
+    fs::{
+        File,
+        metadata,
+    },
 };
 
 use tokio_util::{
@@ -54,6 +64,13 @@ enum Command {
         #[arg(value_parser = ContentId::parse_content_id)]
         content_id: ContentId,
     },
+    Upload {
+        #[arg()]
+        path: PathBuf,
+
+        #[arg(long)]
+        public: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -70,6 +87,8 @@ enum Error {
     GoFileApiError(gofile_api::Error),
     FileCouldntBeCreated(String),
     FileCouldntBeWritten(String),
+    CouldntReadMetadata(String),
+    NotAFile(PathBuf),
 }
 
 impl Display for Error {
@@ -162,6 +181,9 @@ async fn main() -> Result<(), Error> {
         Command::Download { content_id } => {
             download(content_id).await
         },
+        Command::Upload { path, public } => {
+            upload(path, public).await
+        },
     }
 }
 
@@ -182,6 +204,36 @@ async fn download(content_id: ContentId) -> Result<(), Error> {
     }
 }
 
+async fn upload(path: PathBuf, public: bool) -> Result<(), Error> {
+    let api = Api::new();
+    let token = get_token()?;
+    let api = api.authorize(&token);
+
+    let metadata = match metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(err) => return Err(Error::CouldntReadMetadata(format!("{}", err))),
+    };
+
+    if !metadata.is_file() {
+        return Err(Error::NotAFile(path))
+    };
+
+    let server_api = api.get_server().await?;
+    let uploaded_file_info = server_api.upload_file(path).await?;
+
+    let content_id = uploaded_file_info.parent_folder;
+
+    if public {
+        api.set_public_option(content_id, true).await?;
+    } else {
+        api.set_public_option(content_id, false).await?;
+    }
+
+    println!("{}", uploaded_file_info.download_page);
+
+    Ok(())
+}
+
 async fn download_impl(url: Url, filename: String, token: &str) -> Result<(), Error> {
     let client = reqwest::Client::new();
     let res = client.get(url)
@@ -189,7 +241,7 @@ async fn download_impl(url: Url, filename: String, token: &str) -> Result<(), Er
         .send()
         .await?;
     let mut byte_stream = res.bytes_stream().map_err(|err| io::Error::new(io::ErrorKind::Other, err)).into_async_read();
-    let mut file = match tokio::fs::File::create(filename).await {
+    let mut file = match File::create(filename).await {
         Ok(file) => file.compat(),
         Err(err) => return Err(Error::FileCouldntBeCreated(format!("{}", err))),
     };
