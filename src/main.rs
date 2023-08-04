@@ -19,6 +19,7 @@ use uuid::{
 
 use std::{
     error,
+    io,
     env::{
         self,
         VarError,
@@ -31,7 +32,13 @@ use std::{
 };
 
 use futures::{
-    StreamExt,
+    TryStreamExt,
+};
+
+use tokio_util::{
+    compat::{
+        TokioAsyncReadCompatExt,
+    },
 };
 
 #[derive(Parser, Debug)]
@@ -160,41 +167,39 @@ async fn main() -> Result<(), Error> {
 
 async fn download(content_id: ContentId) -> Result<(), Error> {
     let api = Api::new();
-    let api = api.authorize(get_token()?);
+    let token = get_token()?;
+    let api = api.authorize(token.clone());
     match content_id {
-        ContentId::DownloadUrl(url, filename) => download_impl(url, filename).await,
+        ContentId::DownloadUrl(url, filename) => download_impl(url, filename, &token).await,
         ContentId::Uuid(id) => {
             let content = api.get_content_by_id(id).await?;
-            download_all_child_contents(content).await
+            download_all_child_contents(content, &token).await
         },
         ContentId::Code(code) => {
             let content = api.get_content_by_code(code).await?;
-            download_all_child_contents(content).await
+            download_all_child_contents(content, &token).await
         },
     }
 }
 
-async fn download_impl(url: Url, filename: String) -> Result<(), Error> {
+async fn download_impl(url: Url, filename: String, token: &str) -> Result<(), Error> {
     let client = reqwest::Client::new();
     let res = client.get(url)
-        .header("Cookie", format!("accountToken={}", get_token()?))
+        .header("Cookie", format!("accountToken={}", token))
         .send()
         .await?;
-    let mut byte_stream = res.bytes_stream();
+    let mut byte_stream = res.bytes_stream().map_err(|err| io::Error::new(io::ErrorKind::Other, err)).into_async_read();
     let mut file = match tokio::fs::File::create(filename).await {
-        Ok(file) => file,
+        Ok(file) => file.compat(),
         Err(err) => return Err(Error::FileCouldntBeCreated(format!("{}", err))),
     };
-    while let Some(item) = byte_stream.next().await {
-        match tokio::io::copy(&mut item?.as_ref(), &mut file).await {
-            Err(err) => return Err(Error::FileCouldntBeWritten(format!("{}", err))),
-            Ok(_) => (),
-        }
+    match futures::io::copy(&mut byte_stream, &mut file).await {
+        Err(err) => Err(Error::FileCouldntBeWritten(format!("{}", err))),
+        Ok(_) => Ok(()),
     }
-    Ok(())
 }
 
-async fn download_all_child_contents(content: Content) -> Result<(), Error> {
+async fn download_all_child_contents(content: Content, token: &str) -> Result<(), Error> {
     let ContentKind::Folder { contents, .. } = content.kind else {
         return Err(Error::InvalidTopLevelFile(content.name));
     };
@@ -209,7 +214,7 @@ async fn download_all_child_contents(content: Content) -> Result<(), Error> {
         let ContentKind::File { link, .. } = content.kind else {
             return Err(Error::NotImplementedForSubdir);
         };
-        download_impl(link, content.name).await?
+        download_impl(link, content.name, token).await?
     };
     Ok(())
 }

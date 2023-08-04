@@ -393,6 +393,7 @@ dependencies = [
  "gofile_api",
  "reqwest",
  "tokio",
+ "tokio-util",
  "url",
  "uuid",
 ]
@@ -1081,6 +1082,7 @@ checksum = "806fe8c2c87eccc8b3267cbae29ed3ab2d0bd37fca70ab622e46aaa9375ddb7d"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "pin-project-lite",
  "tokio",
