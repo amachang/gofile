@@ -168,7 +168,7 @@ async fn main() -> Result<(), Error> {
 async fn download(content_id: ContentId) -> Result<(), Error> {
     let api = Api::new();
     let token = get_token()?;
-    let api = api.authorize(token.clone());
+    let api = api.authorize(&token);
     match content_id {
         ContentId::DownloadUrl(url, filename) => download_impl(url, filename, &token).await,
         ContentId::Uuid(id) => {
