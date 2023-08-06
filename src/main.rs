@@ -20,6 +20,9 @@ use uuid::{
 use std::{
     error,
     io,
+    pin::{
+        Pin,
+    },
     env::{
         self,
         VarError,
@@ -32,10 +35,17 @@ use std::{
     path::{
         PathBuf,
     },
+    task::{
+        Poll,
+        Context,
+    },
 };
 
 use futures::{
     TryStreamExt,
+    io::{
+        AsyncWrite,
+    },
 };
 
 use tokio::{
@@ -50,6 +60,8 @@ use tokio_util::{
         TokioAsyncReadCompatExt,
     },
 };
+
+use md5;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -89,6 +101,7 @@ enum Error {
     FileCouldntBeWritten(String),
     CouldntReadMetadata(String),
     NotAFile(PathBuf),
+    Md5DigestMismatched(String),
 }
 
 impl Display for Error {
@@ -192,7 +205,10 @@ async fn download(content_id: ContentId) -> Result<(), Error> {
     let token = get_token()?;
     let api = api.authorize(&token);
     match content_id {
-        ContentId::DownloadUrl(url, filename) => download_impl(url, filename, &token).await,
+        ContentId::DownloadUrl(url, filename) => {
+            let _ = download_impl(url, filename, &token).await?;
+            Ok(())
+        },
         ContentId::Uuid(id) => {
             let content = api.get_content_by_id(id).await?;
             download_all_child_contents(content, &token).await
@@ -234,20 +250,21 @@ async fn upload(path: PathBuf, public: bool) -> Result<(), Error> {
     Ok(())
 }
 
-async fn download_impl(url: Url, filename: String, token: &str) -> Result<(), Error> {
+async fn download_impl(url: Url, filename: String, token: &str) -> Result<md5::Digest, Error> {
     let client = reqwest::Client::new();
     let res = client.get(url)
         .header("Cookie", format!("accountToken={}", token))
         .send()
         .await?;
     let mut byte_stream = res.bytes_stream().map_err(|err| io::Error::new(io::ErrorKind::Other, err)).into_async_read();
-    let mut file = match File::create(filename).await {
+    let file = match File::create(filename).await {
         Ok(file) => file.compat(),
         Err(err) => return Err(Error::FileCouldntBeCreated(format!("{}", err))),
     };
+    let mut file = Md5Filter::new(file);
     match futures::io::copy(&mut byte_stream, &mut file).await {
         Err(err) => Err(Error::FileCouldntBeWritten(format!("{}", err))),
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(file.compute_digest()),
     }
 }
 
@@ -263,15 +280,54 @@ async fn download_all_child_contents(content: Content, token: &str) -> Result<()
     };
 
     for (_, content) in contents {
-        let ContentKind::File { link, .. } = content.kind else {
+        let ContentKind::File { link, md5, .. } = content.kind else {
             return Err(Error::NotImplementedForSubdir);
         };
-        download_impl(link, content.name, token).await?
+        let digest = download_impl(link, content.name, token).await?;
+        if md5 != digest.0 {
+            return Err(Error::Md5DigestMismatched(format!("{:x} != {:x}", md5::Digest(md5), digest)));
+        };
     };
     Ok(())
 }
 
 fn get_token() -> Result<String, Error> {
     Ok(env::var("GOFILE_TOKEN")?)
+}
+
+
+struct Md5Filter<W: AsyncWrite> {
+    writer: W,
+    md5_cx: md5::Context,
+}
+
+impl<W: AsyncWrite> Md5Filter<W> {
+    fn new(writer: W) -> Self {
+        Self { writer, md5_cx: md5::Context::new() }
+    }
+
+    fn compute_digest(self) -> md5::Digest {
+        self.md5_cx.compute()
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for Md5Filter<W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        match Pin::new(&mut self.writer).poll_write(cx, buf) {
+            Poll::Ready(Ok(size)) => {
+                self.md5_cx.consume(&buf[..size]);
+                Poll::Ready(Ok(size))
+            },
+            other => other,
+        }
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().writer).poll_close(cx)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().writer).poll_flush(cx)
+    }
 }
 
